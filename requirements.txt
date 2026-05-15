@@ -1,0 +1,7 @@
+matplotlib>=3.7
+numpy>=1.26
+pandas>=2.0
+plotly>=5.18
+scikit-learn>=1.4
+jupyter>=1.0
+ipykernel>=6.25
