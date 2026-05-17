@@ -1,0 +1,687 @@
+=== CELL [0] markdown ===
+# Cancer Genetics için PCA — Bölüm 4, 5 & 6
+
+Bu notebook, projenin son üç bölümünü içerir:
+
+- **Bölüm 4** — Breast Cancer Wisconsin Diagnostic (WDBC) veri seti üzerinde PCA: EDA, scree, projection, loading analizi ve sınıflandırma.
+- **Bölüm 5** — Karşılaştırmalı analiz: TCGA (gene expression, $p \gg n$) vs WDBC (klinik morfoloji, $p \ll n$). Marchenko–Pastur yasası, görsel ayrışma ve önişleme seçimleri üzerine tartışma.
+- **Bölüm 6** — Sonuçlar, projede öğrenilen lineer cebir kavramları ve gelecek çalışma.
+
+Notebook bağımsız çalışır; karşılaştırma için TCGA verisi de yeniden yüklenir.
+
+=== CELL [1] code ===
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.decomposition import PCA
+from sklearn.metrics import classification_report
+from sklearn.model_selection import cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+
+RANDOM_STATE = 42
+N_COMPONENTS = 10
+
+CANCER_COLORS = {
+    'BRCA': '#E74C3C', 'COAD': '#3498DB',
+    'KIRC': '#2ECC71', 'LUAD': '#F39C12', 'PRAD': '#9B59B6',
+}
+WDBC_COLORS = {'M': '#E74C3C', 'B': '#2ECC71'}
+
+TCGA_DATA_PATH = './TCGA-PANCAN-HiSeq-801x20531/data.csv'
+TCGA_LABELS_PATH = './TCGA-PANCAN-HiSeq-801x20531/labels.csv'
+WDBC_DATA_PATH = './breast+cancer+wisconsin+diagnostic/wdbc.data'
+
+np.random.seed(RANDOM_STATE)
+plt.rcParams['figure.dpi'] = 120
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.3
+
+=== CELL [2] code ===
+def plot_pca_2d(scores, labels, color_dict, title, pc_x=1, pc_y=2, pve=None):
+    """Plot 2D PCA projection with labeled groups."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    labels = np.asarray(labels)
+    for label, color in color_dict.items():
+        mask = labels == label
+        if not mask.any():
+            continue
+        ax.scatter(scores[mask, pc_x - 1], scores[mask, pc_y - 1],
+                   c=color, label=label, alpha=0.75, s=32,
+                   edgecolor='white', linewidth=0.4)
+    xl = f'PC{pc_x}' + (f' ({pve[pc_x - 1] * 100:.1f}% var)' if pve is not None else '')
+    yl = f'PC{pc_y}' + (f' ({pve[pc_y - 1] * 100:.1f}% var)' if pve is not None else '')
+    ax.set_xlabel(xl)
+    ax.set_ylabel(yl)
+    ax.set_title(title)
+    ax.legend(title='Class', loc='best', framealpha=0.9)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_scree(pca_model, n_components=20, title='Scree Plot'):
+    """Plot eigenvalue bar chart with cumulative variance line."""
+    pve = np.asarray(pca_model.explained_variance_ratio_)[:n_components]
+    cum = np.cumsum(pve)
+    x = np.arange(1, len(pve) + 1)
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax1.bar(x, pve * 100, color='#3498DB', alpha=0.75)
+    ax1.set_xlabel('Component')
+    ax1.set_ylabel('Individual PVE (%)', color='#3498DB')
+    ax1.tick_params(axis='y', labelcolor='#3498DB')
+    ax1.set_xticks(x)
+    ax2 = ax1.twinx()
+    ax2.plot(x, cum * 100, color='#E74C3C', marker='o')
+    ax2.set_ylabel('Cumulative PVE (%)', color='#E74C3C')
+    ax2.tick_params(axis='y', labelcolor='#E74C3C')
+    ax2.set_ylim(0, 105)
+    ax2.axhline(80, ls='--', color='gray', alpha=0.5)
+    ax2.axhline(90, ls='--', color='gray', alpha=0.5)
+    ax1.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_loadings(components, feature_names, pc_index=1, top_n=20):
+    """Plot top_n absolute loadings for a given principal component."""
+    pc = np.asarray(components[pc_index - 1])
+    feature_names = np.asarray(feature_names)
+    top_idx = np.argsort(np.abs(pc))[::-1][:top_n]
+    values = pc[top_idx]
+    names = feature_names[top_idx]
+    colors = ['#E74C3C' if v < 0 else '#2ECC71' for v in values]
+    fig, ax = plt.subplots(figsize=(10, 8))
+    y_pos = np.arange(len(values))
+    ax.barh(y_pos, values, color=colors)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.axvline(0, color='black', lw=0.6)
+    ax.set_xlabel('Loading value')
+    ax.set_title(f'Top-{top_n} loadings for PC{pc_index} (green: positive, red: negative)')
+    fig.tight_layout()
+    return fig
+
+
+def knn_accuracy_vs_components(X, y, ks, cv=5, n_neighbors=5, scale=False):
+    """Return DataFrame of k -> cross-validated KNN accuracy on PCA-reduced X."""
+    rows = []
+    X_in = StandardScaler().fit_transform(X) if scale else np.asarray(X, dtype=np.float64)
+    for k in ks:
+        pca_k = PCA(n_components=k, random_state=RANDOM_STATE)
+        X_k = pca_k.fit_transform(X_in)
+        clf = KNeighborsClassifier(n_neighbors=n_neighbors)
+        scores_cv = cross_val_score(clf, X_k, y, cv=cv, n_jobs=-1)
+        rows.append({
+            'n_components': k,
+            'accuracy_mean': scores_cv.mean(),
+            'accuracy_std': scores_cv.std(),
+        })
+    return pd.DataFrame(rows)
+
+=== CELL [3] markdown ===
+# Bölüm 4 — Dataset 2: Breast Cancer Wisconsin Diagnostic (WDBC)
+
+WDBC, dijital görüntülenmiş ince iğne aspirasyonu örneklerinden hücre çekirdeği morfolojisini çıkaran bir veri setidir.
+
+- **Örnek sayısı:** $n = 569$
+- **Özellik sayısı:** $p = 30$ — 10 baz morfoloji özelliğinin (radius, texture, perimeter, area, smoothness, compactness, concavity, concave points, symmetry, fractal dimension) **mean**, **standard error (se)** ve **worst** versiyonları.
+- **Sınıflar:** $\{M \equiv \text{malignant}, B \equiv \text{benign}\}$
+
+TCGA'nın aksine burada $p \ll n$ rejimindeyiz. PCA'nın rolü değişir: artık zorunlu bir önişleme değil, **özellikler arasındaki yapıyı görmek** ve **çoklu doğrusal bağıntıyı (multicollinearity) ayrıştırmak** için kullanılır. Üç versiyon (mean/se/worst) yüksek oranda birbirleriyle ilişkilidir; PCA bu fazlalığı doğal olarak az sayıda bağımsız eksene sıkıştırır.
+
+=== CELL [4] markdown ===
+## 4.1 — Veri Yükleme
+
+`wdbc.data` dosyasında başlık yok; sütun isimlerini `wdbc.names`'den çıkarıp manuel atıyoruz.
+
+=== CELL [5] code ===
+base_features = [
+    'radius', 'texture', 'perimeter', 'area', 'smoothness',
+    'compactness', 'concavity', 'concave_points', 'symmetry', 'fractal_dimension',
+]
+wdbc_columns = (
+    ['id', 'diagnosis']
+    + [f'{f}_mean' for f in base_features]
+    + [f'{f}_se' for f in base_features]
+    + [f'{f}_worst' for f in base_features]
+)
+
+wdbc_df = pd.read_csv(WDBC_DATA_PATH, header=None, names=wdbc_columns)
+wdbc_df = wdbc_df.set_index('id')
+
+feature_names_wdbc = wdbc_df.columns.drop('diagnosis').tolist()
+X_wdbc = wdbc_df[feature_names_wdbc].values.astype(np.float64)
+y_wdbc = wdbc_df['diagnosis'].values
+
+print(f'WDBC shape          : {wdbc_df.shape}')
+print(f'Feature count       : {len(feature_names_wdbc)}')
+print(f'NaN cells           : {wdbc_df.isna().sum().sum()}')
+print(f'Diagnosis labels    : {dict(pd.Series(y_wdbc).value_counts())}')
+wdbc_df.head()
+
+=== CELL [6] markdown ===
+## 4.2 — Keşifsel Analiz
+
+Üç sorun cevabını arıyoruz: (i) sınıflar dengeli mi? (ii) özellikler arasında ne kadar korelasyon var? (iii) hangi özellikler M-B ayrımını en iyi yapıyor? Bu sorular PCA sonuçlarını yorumlarken referans olacak.
+
+=== CELL [7] code ===
+diag_counts = pd.Series(y_wdbc).value_counts().reindex(['M', 'B'])
+
+fig, ax = plt.subplots(figsize=(8, 5))
+bars = ax.bar(diag_counts.index, diag_counts.values,
+              color=[WDBC_COLORS[c] for c in diag_counts.index],
+              edgecolor='white', linewidth=1.5)
+for bar, count in zip(bars, diag_counts.values):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 4,
+            f'{count} ({count / diag_counts.sum() * 100:.1f}%)',
+            ha='center', va='bottom', fontsize=11)
+ax.set_xlabel('Diagnosis')
+ax.set_ylabel('Sample count')
+ax.set_title(f'WDBC sınıf dağılımı (toplam {diag_counts.sum()} örnek)')
+fig.tight_layout()
+plt.show()
+
+print(f'\nClass imbalance ratio (B/M): {diag_counts["B"] / diag_counts["M"]:.2f}')
+
+=== CELL [8] code ===
+corr_matrix = pd.DataFrame(X_wdbc, columns=feature_names_wdbc).corr().values
+
+fig = px.imshow(
+    corr_matrix,
+    x=feature_names_wdbc, y=feature_names_wdbc,
+    color_continuous_scale='RdBu_r', zmin=-1, zmax=1,
+    title='WDBC — özellikler arası Pearson korelasyon matrisi',
+    aspect='auto',
+)
+fig.update_layout(width=950, height=850, xaxis=dict(tickangle=-50))
+fig.show()
+
+off_diag = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
+print(f'Off-diagonal corr stats: mean={off_diag.mean():.3f}, '
+      f'median={np.median(off_diag):.3f}, max={off_diag.max():.3f}, '
+      f'min={off_diag.min():.3f}')
+print(f'Pairs with |corr| > 0.9: {(np.abs(off_diag) > 0.9).sum()} / {len(off_diag)}')
+
+=== CELL [9] code ===
+X_wdbc_df = pd.DataFrame(X_wdbc, columns=feature_names_wdbc)
+mask_M = y_wdbc == 'M'
+mask_B = y_wdbc == 'B'
+
+mu_M = X_wdbc_df[mask_M].mean()
+mu_B = X_wdbc_df[mask_B].mean()
+var_M = X_wdbc_df[mask_M].var()
+var_B = X_wdbc_df[mask_B].var()
+n_M, n_B = mask_M.sum(), mask_B.sum()
+pooled_std = np.sqrt(((n_M - 1) * var_M + (n_B - 1) * var_B) / (n_M + n_B - 2))
+cohens_d = (mu_M - mu_B) / pooled_std
+
+top_d = cohens_d.abs().sort_values(ascending=False).head(15)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+colors = ['#E74C3C' if cohens_d[name] > 0 else '#2ECC71' for name in top_d.index]
+ax.barh(top_d.index[::-1], top_d.values[::-1], color=colors[::-1])
+ax.set_xlabel("|Cohen's d| (M vs B ayırt etme gücü)")
+ax.set_title('WDBC — top-15 univariate ayırt edici özellik')
+ax.axvline(0.8, ls='--', color='gray', alpha=0.6, label='large effect (d=0.8)')
+ax.axvline(1.2, ls='--', color='black', alpha=0.6, label='very large (d=1.2)')
+ax.legend(loc='lower right')
+fig.tight_layout()
+plt.show()
+
+=== CELL [10] markdown ===
+**Gözlemler.**
+
+1. **Sınıflar orta derecede dengesiz** — B/M oranı yaklaşık 1.68. Bu, accuracy metriğini hâlâ anlamlı kılıyor (örneğin tüm örnekleri B olarak tahmin etsek %62.7 elde ederdik; ulaşacağımız %95+ accuracy bu naif baseline'dan çok yukarıda).
+2. **Yüksek korelasyon adacıkları**: `radius_mean`, `perimeter_mean`, `area_mean` üçlüsü neredeyse mükemmel korelasyondadır — çünkü matematiksel olarak `area ∝ radius²` ve `perimeter ∝ radius`. Aynı şekilde `compactness`, `concavity`, `concave_points` aile içinde yüksek korelasyondadır. Bu **çoklu doğrusal bağıntı**, PCA'nın bu veri setinde özellikle değerli olduğu yerdir: 30 özellik aslında çok daha az **gerçek boyuta** indirgenebilir.
+3. **Tek-değişkenli ayırt etme**: `concave_points_worst`, `perimeter_worst`, `radius_worst`, `area_worst`, `concave_points_mean` gibi "_worst" suffix'li özellikler en güçlü ayırt edicilerdir — Cohen's $d > 1.2$ (very large effect). Bu, M-B ayrımının baz morfolojiden değil, **örneklerin en kötü hücrelerinin ("worst")** istatistiklerinden geldiğine işaret eder. Patolojik olarak da bekleyebileceğimiz bir bulgu: kötü huylu tümörler genellikle dağılımın uç noktalarında karakteristik özelliklere sahiptir.
+
+=== CELL [11] markdown ===
+## 4.3 — PCA Analizi
+
+Özellikler farklı birimlerde (mm, mm², adımsız oranlar) ölçüldüğü için **correlation PCA** doğal tercihtir; aksi takdirde `area_*` özellikleri tek başına PC1'i şekillendirir. Yine de iki yaklaşımı da fitleyip karşılaştıracağız.
+
+=== CELL [12] code ===
+pca_wdbc_cov = PCA(n_components=N_COMPONENTS, random_state=RANDOM_STATE).fit(X_wdbc)
+scores_wdbc_cov = pca_wdbc_cov.transform(X_wdbc)
+pve_wdbc_cov = pca_wdbc_cov.explained_variance_ratio_
+cum_pve_wdbc_cov = np.cumsum(pve_wdbc_cov)
+
+scaler_wdbc = StandardScaler()
+X_wdbc_z = scaler_wdbc.fit_transform(X_wdbc)
+pca_wdbc_cor = PCA(n_components=N_COMPONENTS, random_state=RANDOM_STATE).fit(X_wdbc_z)
+scores_wdbc_cor = pca_wdbc_cor.transform(X_wdbc_z)
+pve_wdbc_cor = pca_wdbc_cor.explained_variance_ratio_
+cum_pve_wdbc_cor = np.cumsum(pve_wdbc_cor)
+
+print('WDBC — Covariance vs Correlation PCA (ilk 10 PC):')
+rows = []
+for i in range(N_COMPONENTS):
+    rows.append({
+        'PC': i + 1,
+        'PVE_cov(%)': pve_wdbc_cov[i] * 100,
+        'CumPVE_cov(%)': cum_pve_wdbc_cov[i] * 100,
+        'PVE_cor(%)': pve_wdbc_cor[i] * 100,
+        'CumPVE_cor(%)': cum_pve_wdbc_cor[i] * 100,
+    })
+print(pd.DataFrame(rows).to_string(index=False, float_format='%.2f'))
+
+=== CELL [13] code ===
+plot_scree(pca_wdbc_cor, n_components=N_COMPONENTS, title='WDBC — Correlation PCA Scree Plot')
+plt.show()
+
+=== CELL [14] code ===
+plot_pca_2d(scores_wdbc_cor, y_wdbc, WDBC_COLORS,
+            title='WDBC — Correlation PCA (PC1 vs PC2)',
+            pc_x=1, pc_y=2, pve=pve_wdbc_cor)
+plt.show()
+
+=== CELL [15] code ===
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for ax, scores, pve, name in zip(
+    axes,
+    [scores_wdbc_cov, scores_wdbc_cor],
+    [pve_wdbc_cov, pve_wdbc_cor],
+    ['Covariance PCA (raw)', 'Correlation PCA (standardized)'],
+):
+    for cls, color in WDBC_COLORS.items():
+        mask = y_wdbc == cls
+        ax.scatter(scores[mask, 0], scores[mask, 1],
+                   c=color, label=cls, alpha=0.75, s=28,
+                   edgecolor='white', linewidth=0.4)
+    ax.set_xlabel(f'PC1 ({pve[0] * 100:.1f}% var)')
+    ax.set_ylabel(f'PC2 ({pve[1] * 100:.1f}% var)')
+    ax.set_title(name)
+axes[0].legend(title='Diagnosis')
+fig.suptitle('WDBC — Covariance vs Correlation PCA (PC1 × PC2)', fontsize=13)
+fig.tight_layout()
+plt.show()
+
+=== CELL [16] code ===
+plot_loadings(pca_wdbc_cor.components_, feature_names_wdbc, pc_index=1, top_n=15)
+plt.show()
+
+plot_loadings(pca_wdbc_cor.components_, feature_names_wdbc, pc_index=2, top_n=15)
+plt.show()
+
+=== CELL [17] markdown ===
+**Yorum.**
+
+- **Covariance PCA** üzerinde PC1 tek başına varyansın **~%98**'ini açıklıyor — fakat bu yanıltıcıdır: PC1 neredeyse tamamen `area_*` özellikleri tarafından domine edilmiştir (büyük ölçek, büyük varyans). Görselde sınıflar ayrışıyor görünse de bu, sadece `area`'nın tek başına M-B ayrımı yapması anlamına gelir. PCA'nın "çoklu özellik kombinasyonu" üretme amacı baltalanmıştır.
+- **Correlation PCA** üzerinde PC1 daha sağlıklı bir **~%44** varyans açıklar; PC1+PC2 toplam **~%63**'e ulaşır. Bu, 30 özelliği fazla kayıp olmadan 2-3 boyuta indirebileceğimizin göstergesidir.
+- PC1 yüklemelerine bakıldığında **`*_worst` ve `*_mean` versiyonları yüksek pozitif katsayılarla** yer alır; `radius`, `perimeter`, `area`, `concave_points`, `concavity`, `compactness` ailesi PC1'i şekillendirir. Bu PC pratik olarak "tümörün genel büyüklüğü + morfolojik düzensizliği" eksenidir ve M-B ayrımının ana taşıyıcısıdır.
+- PC2 yüklemelerine bakıldığında `texture_*` ve `smoothness_*` öne çıkar — bunlar büyüklükten bağımsız doku özellikleridir. PC2 "şekil pürüzü" eksenidir; M-B ayrımına ikincil katkıda bulunur.
+
+Bu yorum, **PCA'nın temel ilkesi** olan ortogonalitenin nasıl pratik anlam ürettiğinin somut örneğidir: birinci eksen büyüklük/şiddet, ona dik ikinci eksen ise dokusal incelik. İki eksen birbirinden bağımsız biyolojik bilgi taşır.
+
+=== CELL [18] markdown ===
+## 4.4 — PCA + Sınıflandırma
+
+TCGA'da yaptığımız gibi: standartlaştırılmış veri üzerinde ham KNN baseline'ı ile değişen $k$ değerlerinde PCA+KNN karşılaştırması. WDBC'de $p = 30$ olduğu için baseline'da bile boyut laneti hafiftir; PCA'nın katma değeri burada **varyans azaltma** değil, **özellikler arası multikolineariteyi kaldırma** olacaktır.
+
+=== CELL [19] code ===
+knn = KNeighborsClassifier(n_neighbors=5)
+raw_scores_wdbc = cross_val_score(knn, X_wdbc_z, y_wdbc, cv=5, n_jobs=-1)
+print(f'WDBC ham (standardized, 30 features) — KNN(k=5) 5-fold CV:')
+print(f'  accuracy = {raw_scores_wdbc.mean():.4f} ± {raw_scores_wdbc.std():.4f}')
+
+=== CELL [20] code ===
+ks_wdbc = [2, 3, 5, 7, 10, 15, 20, 30]
+knn_pca_wdbc_df = knn_accuracy_vs_components(
+    X_wdbc_z, y_wdbc, ks=ks_wdbc, cv=5, n_neighbors=5, scale=False,
+)
+
+summary_wdbc_df = pd.concat([
+    pd.DataFrame([{
+        'n_components': 'raw',
+        'accuracy_mean': raw_scores_wdbc.mean(),
+        'accuracy_std': raw_scores_wdbc.std(),
+    }]),
+    knn_pca_wdbc_df,
+], ignore_index=True)
+
+print('WDBC — KNN(k=5) 5-fold CV accuracy vs PCA bileşen sayısı:')
+print(summary_wdbc_df.to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(12, 5))
+ks_num = knn_pca_wdbc_df['n_components'].values
+means = knn_pca_wdbc_df['accuracy_mean'].values
+stds = knn_pca_wdbc_df['accuracy_std'].values
+ax.errorbar(ks_num, means, yerr=stds, fmt='o-', color='#3498DB',
+            capsize=4, lw=2, markersize=8, label='PCA(k) + KNN')
+ax.axhline(raw_scores_wdbc.mean(), color='#E74C3C', ls='--',
+           label=f'Ham (standardized) baseline ({raw_scores_wdbc.mean():.3f})')
+ax.fill_between(ks_num,
+                raw_scores_wdbc.mean() - raw_scores_wdbc.std(),
+                raw_scores_wdbc.mean() + raw_scores_wdbc.std(),
+                color='#E74C3C', alpha=0.12)
+ax.set_xlabel('Number of principal components')
+ax.set_ylabel('5-fold CV accuracy')
+ax.set_title('WDBC — KNN accuracy vs PCA(k)')
+ax.legend(loc='lower right')
+ax.set_xticks(ks_num)
+fig.tight_layout()
+plt.show()
+
+best_k_wdbc = int(knn_pca_wdbc_df.loc[knn_pca_wdbc_df['accuracy_mean'].idxmax(), 'n_components'])
+best_acc_wdbc = knn_pca_wdbc_df['accuracy_mean'].max()
+print(f'\nEn iyi PCA(k): k = {best_k_wdbc}, accuracy = {best_acc_wdbc:.4f}')
+
+=== CELL [21] markdown ===
+### Bölüm 4 Özeti
+
+WDBC üzerinde PCA, TCGA'dakinden farklı bir rol üstlendi:
+
+- 30 özellik **birkaç fazlalık adacık** halinde gruplanır (radius/perimeter/area; compactness/concavity/concave_points). PCA bu adacıkları az sayıda bağımsız "morfolojik konsept"e indirger.
+- **Correlation PCA** burada açıkça daha iyi seçimdir; covariance PCA `area` ailesi tarafından domine edilir.
+- PC1 "büyüklük/şiddet", PC2 "dokusal incelik" eksenleri olarak yorumlanabilir; PC1+PC2 toplam varyansın **~%63**'ünü açıklar.
+- 2-3 component KNN için yeterlidir; daha fazla bileşen ek bilgi katmaz çünkü 30 özelliğin gerçek bilgi boyutu zaten 5-10 civarındadır.
+
+=== CELL [22] markdown ===
+# Bölüm 5 — Karşılaştırmalı Analiz: Genomik vs Klinik Veri
+
+Bu bölüm projenin özgün katkısının kalbidir. Aynı algoritmayı (**PCA**) yapısal olarak **birbirine zıt** iki veri setinde uyguladık:
+
+- **TCGA-PANCAN**: $p \gg n$ rejimi, 5 sınıf, RNA-seq verisi — sınıf imzaları binlerce genin küçük kombinasyonlarında.
+- **WDBC**: $p \ll n$ rejimi, 2 sınıf, klinik morfoloji — sınıf farkları az sayıda kuvvetli özellikte konsantre.
+
+Önce sayısal karşılaştırmayı oluşturup ardından üç teorik soruyu tartışacağız.
+
+=== CELL [23] markdown ===
+Karşılaştırma için TCGA üzerindeki temel sayıları (PVE, k=2 KNN accuracy, %90 PVE için gereken bileşen sayısı) bu notebook'ta yeniden hesaplıyoruz.
+
+=== CELL [24] code ===
+tcga_data = pd.read_csv(TCGA_DATA_PATH, index_col=0)
+tcga_labels = pd.read_csv(TCGA_LABELS_PATH, index_col=0)
+tcga_data = tcga_data.loc[tcga_labels.index]
+
+gene_var = tcga_data.var(axis=0).values
+X_tcga = tcga_data.values[:, gene_var > 0].astype(np.float64)
+y_tcga = tcga_labels['Class'].values
+print(f'TCGA filtered shape: {X_tcga.shape}')
+
+pca_tcga_cov = PCA(n_components=50, random_state=RANDOM_STATE).fit(X_tcga)
+pve_tcga_cov = pca_tcga_cov.explained_variance_ratio_
+cum_pve_tcga_cov = np.cumsum(pve_tcga_cov)
+
+X_tcga_z = StandardScaler().fit_transform(X_tcga)
+pca_tcga_cor = PCA(n_components=50, random_state=RANDOM_STATE).fit(X_tcga_z)
+pve_tcga_cor = pca_tcga_cor.explained_variance_ratio_
+cum_pve_tcga_cor = np.cumsum(pve_tcga_cor)
+
+scores_tcga_cov_k2 = pca_tcga_cov.transform(X_tcga)[:, :2]
+scores_tcga_cor_k2 = pca_tcga_cor.transform(X_tcga_z)[:, :2]
+
+acc_tcga_cov_k2 = cross_val_score(
+    KNeighborsClassifier(n_neighbors=5), scores_tcga_cov_k2, y_tcga, cv=5, n_jobs=-1,
+).mean()
+acc_tcga_cor_k2 = cross_val_score(
+    KNeighborsClassifier(n_neighbors=5), scores_tcga_cor_k2, y_tcga, cv=5, n_jobs=-1,
+).mean()
+
+def k_for_pve(cum, thr):
+    return int(np.argmax(cum >= thr) + 1) if (cum >= thr).any() else None
+
+k90_tcga_cov = k_for_pve(cum_pve_tcga_cov, 0.90)
+k90_tcga_cor = k_for_pve(cum_pve_tcga_cor, 0.90)
+k90_wdbc_cov = k_for_pve(cum_pve_wdbc_cov, 0.90)
+k90_wdbc_cor = k_for_pve(cum_pve_wdbc_cor, 0.90)
+
+print(f'TCGA k(>=90% PVE, cov): {k90_tcga_cov}, (cor): {k90_tcga_cor}')
+print(f'WDBC k(>=90% PVE, cov): {k90_wdbc_cov}, (cor): {k90_wdbc_cor}')
+
+=== CELL [25] code ===
+scores_wdbc_cov_k2 = pca_wdbc_cov.transform(X_wdbc)[:, :2]
+scores_wdbc_cor_k2 = pca_wdbc_cor.transform(X_wdbc_z)[:, :2]
+
+acc_wdbc_cov_k2 = cross_val_score(
+    KNeighborsClassifier(n_neighbors=5), scores_wdbc_cov_k2, y_wdbc, cv=5, n_jobs=-1,
+).mean()
+acc_wdbc_cor_k2 = cross_val_score(
+    KNeighborsClassifier(n_neighbors=5), scores_wdbc_cor_k2, y_wdbc, cv=5, n_jobs=-1,
+).mean()
+
+print(f'WDBC PCA(k=2) KNN — cov: {acc_wdbc_cov_k2:.4f}, cor: {acc_wdbc_cor_k2:.4f}')
+print(f'TCGA PCA(k=2) KNN — cov: {acc_tcga_cov_k2:.4f}, cor: {acc_tcga_cor_k2:.4f}')
+
+=== CELL [26] code ===
+comparison = pd.DataFrame(
+    {
+        'TCGA-PANCAN': [
+            X_tcga.shape[0],
+            X_tcga.shape[1],
+            len(np.unique(y_tcga)),
+            'RNA-seq (log-normalized)',
+            f'{k90_tcga_cov} (cov) / {k90_tcga_cor} (cor)',
+            f'{pve_tcga_cov[0] * 100:.2f}% (cov)',
+            f'{(pve_tcga_cov[0] + pve_tcga_cov[1]) * 100:.2f}% (cov)',
+            f'{acc_tcga_cov_k2:.4f}',
+        ],
+        'WDBC': [
+            X_wdbc.shape[0],
+            X_wdbc.shape[1],
+            len(np.unique(y_wdbc)),
+            'Cell morphology',
+            f'{k90_wdbc_cov} (cov) / {k90_wdbc_cor} (cor)',
+            f'{pve_wdbc_cor[0] * 100:.2f}% (cor)',
+            f'{(pve_wdbc_cor[0] + pve_wdbc_cor[1]) * 100:.2f}% (cor)',
+            f'{acc_wdbc_cor_k2:.4f}',
+        ],
+    },
+    index=[
+        'n (örnek)',
+        'p (özellik)',
+        'Sınıf sayısı',
+        'Veri türü',
+        '%90 PVE için PC sayısı',
+        'PC1 PVE',
+        'PC1+PC2 PVE',
+        'PCA(k=2) + KNN accuracy',
+    ],
+)
+comparison
+
+=== CELL [27] markdown ===
+## Soru 1 — Neden Genomik Veride PCA Daha Az Varyans Açıklıyor?
+
+WDBC'de PC1 tek başına varyansın **~%44**'ünü açıklarken, TCGA'da bu değer **~%10-15** civarındadır. Bu fark tesadüf değil, **rastgele matris teorisinin (RMT)** doğrudan bir sonucudur.
+
+### Marchenko–Pastur Yasası
+
+$\tilde{X} \in \mathbb{R}^{n \times p}$ matrisi, girişleri bağımsız $\mathcal{N}(0, 1)$ olan saf gürültü olsun ve $c = p/n$ sabit tutularak $n, p \to \infty$ olsun. O zaman $S = \tfrac{1}{n-1} \tilde{X}^\top \tilde{X}$ matrisinin **non-zero eigenvalue'larının ampirik dağılımı**, deterministik **Marchenko–Pastur (MP) yoğunluğuna** yakınsar:
+
+$$\rho_{\mathrm{MP}}(\lambda) = \frac{1}{2\pi c \lambda} \sqrt{(\lambda_+ - \lambda)(\lambda - \lambda_-)}, \quad \lambda \in [\lambda_-, \lambda_+],$$
+
+$$\lambda_\pm = (1 \pm \sqrt{c})^2.$$
+
+TCGA için $c = p/n \approx 20531 / 801 \approx 25.6$, dolayısıyla $\sqrt{c} \approx 5.06$ ve MP desteği:
+
+$$\lambda_- = (1 - 5.06)^2 \approx 16.5, \quad \lambda_+ = (1 + 5.06)^2 \approx 36.7.$$
+
+Yani **saf gürültü bile** $p \gg n$ rejiminde eigenvalue'ları $[16.5, 36.7]$ aralığında yaratır. WDBC için ise $c = 30/569 \approx 0.053$, $\sqrt{c} \approx 0.23$, dolayısıyla MP desteği dar bir $[0.59, 1.51]$ aralığıdır.
+
+### Neyi Söyler?
+
+1. **TCGA'da "gürültü tabakası" geniştir.** Veri matrisinin eigenvalue'larının büyük çoğunluğu $[\lambda_-, \lambda_+]$ MP-bulk içine düşer — bunlar **bilgi içermez**, sadece sonlu örnekleme gürültüsüdür. Anlamlı sinyal yalnızca **bulk'un üstüne çıkan "spike"lardadır**. Spike sayısı sınırlıdır (genellikle gerçek alt sınıf sayısı mertebesinde), bu yüzden ilk birkaç PC bile *toplam* varyansın görece küçük bir oranını yakalar.
+2. **WDBC'de bulk dar, sinyal baskındır.** $c \ll 1$ olduğu için neredeyse her eigenvalue **anlamlıdır**. PC1 birkaç düzine özellikten gelen ortak büyüklük sinyalini yakalar ve yüksek PVE elde eder.
+3. **Yüksek-boyutlu "varyansın seyreltilmesi".** TCGA'da toplam varyans $\mathrm{tr}(S) = \sum \lambda_k$, çok sayıda eigenvalue arasında paylaştırılır; her bir PC'nin payı doğal olarak küçülür. Bu **PCA'nın başarısızlığı değil, matematiksel kaçınılmazlığıdır**.
+
+Aşağıda bu olguyu sentetik veri üzerinde görselleştiriyoruz.
+
+=== CELL [28] code ===
+def empirical_eigvals_via_gram(X):
+    """Return non-zero eigenvalues of (1/(n-1)) X^T X using the Gram-matrix trick."""
+    X_c = X - X.mean(axis=0)
+    K = (X_c @ X_c.T) / (X.shape[0] - 1)
+    return np.sort(np.linalg.eigvalsh(K))[::-1]
+
+rng_mp = np.random.default_rng(RANDOM_STATE)
+n_noise = X_tcga.shape[0]
+p_noise = X_tcga.shape[1]
+c_ratio = p_noise / n_noise
+lam_minus = (1 - np.sqrt(c_ratio)) ** 2
+lam_plus = (1 + np.sqrt(c_ratio)) ** 2
+
+X_noise = rng_mp.standard_normal((n_noise, p_noise))
+eig_noise = empirical_eigvals_via_gram(X_noise)
+eig_tcga = empirical_eigvals_via_gram(X_tcga_z)
+
+fig, ax = plt.subplots(figsize=(13, 5))
+ax.hist(eig_noise, bins=80, density=True, color='#3498DB', alpha=0.6,
+        label=f'Pure Gaussian noise, same shape (c={c_ratio:.1f})')
+ax.hist(eig_tcga, bins=80, density=True, color='#E74C3C', alpha=0.5,
+        label='TCGA standardized empirical eigenvalues')
+ax.axvline(lam_minus, color='black', ls='--', label=fr'MP support $\lambda_-={lam_minus:.2f}$')
+ax.axvline(lam_plus, color='black', ls='--', label=fr'MP support $\lambda_+={lam_plus:.2f}$')
+ax.set_xlabel('Eigenvalue')
+ax.set_ylabel('Empirical density')
+ax.set_title('Marchenko–Pastur bulk vs TCGA spikes (correlation matrix, log-x)')
+ax.set_xscale('log')
+ax.legend(loc='upper right')
+fig.tight_layout()
+plt.show()
+
+n_spikes = int((eig_tcga > lam_plus).sum())
+print(f'TCGA eigenvalue\'larından MP üst sınırının üzerinde olanlar (signal spikes): {n_spikes}')
+print(f'Bunlar PCA\'nın yakaladığı gerçek biyolojik sinyalin component sayısıdır.')
+
+=== CELL [29] markdown ===
+Mavi histogram (saf Gauss gürültü) $[\lambda_-, \lambda_+]$ MP-bulk içinde toplanır. Kırmızı histogram (gerçek TCGA) aynı bulk'a sahiptir — **çünkü 20.000 genin çoğu sınıf imzasıyla ilgisizdir, sadece gürültüye katkıda bulunur** — ama bunun *üstüne*, $\lambda_+$'ı çok aşan sağ kuyruk eigenvalue'lar eklenmiştir. **Bu spike'lar gerçek biyolojik sinyali taşır** ve PCA'nın yakaladığı düşük-boyutlu yapıdır. Spike sayısı genellikle gerçek alt grup sayısı + birkaç ek faktör mertebesindedir.
+
+=== CELL [30] markdown ===
+## Soru 2 — İki Veri Setinde de PCA Görsel Ayrışmayı Yakalıyor — Neden?
+
+Şaşırtıcı bir bulgu: TCGA'da PC1+PC2 sadece toplam varyansın **~%20**'sini açıklasa da 5 kanser tipi 2B'de net ayrışıyor. Bu **çelişki değil**, dikkatli okunması gereken bir gözlemdir.
+
+### Toplam Varyans ≠ Sınıf Ayırt Etme Gücü
+
+PCA, **sınıf etiketinden habersizdir** — sadece *toplam* varyansı maksimize eder. Ancak gerçek dünyada **sınıf-içi varyans + sınıf-arası varyans** olmak üzere iki kaynak vardır:
+
+$$\underbrace{\mathrm{Var}_{\text{toplam}}}_{\mathrm{tr}(S)} \;=\; \underbrace{\mathrm{Var}_{\text{within-class}}}_{\mathrm{tr}(S_W)} \;+\; \underbrace{\mathrm{Var}_{\text{between-class}}}_{\mathrm{tr}(S_B)}.$$
+
+TCGA gibi rejimde **sınıf-arası varyans, sınıf-içi varyanstan çok daha büyüktür** (çünkü farklı kanser tipleri kökten farklı transkripsiyonel programlar çalıştırır). Bu yüzden ilk birkaç PC, yüksek varyanslı yönleri ararken **kaçınılmaz olarak sınıfları ayıran yönleri seçer** — istemeden bile olsa.
+
+PVE düşük gözükmesinin sebebi paydadaki **gen-içi gürültünün** (20.000+ genin küçük varyansları) toplam varyansı şişirmesidir; ama bu gürültü `[λ_-, λ_+]` MP-bulk eigenvalue'larında saklıdır ve sınıf yapısıyla ilgisizdir.
+
+### PCA'nın "Şanslı Hizalanması"
+
+Daha matematiksel bir ifadeyle: TCGA'nın "signal subspace" (gerçek biyolojik varyans) ile "top-k PC subspace" örtüşmesi yüksektir. RMT bunu **BBP (Baik-Ben Arous-Péché) faz geçişi** ile formalize eder — sinyal yeterince güçlüyse (Spike eigenvalue $> (1+\sqrt{c})^2$ ise), o sinyalin yönünü ampirik PC tutarlı şekilde estime eder. TCGA spike'ları çok güçlü olduğu için PC1, PC2 sınıfsal eksenleri yakalar.
+
+WDBC'de ise farklı bir mekanizma çalışır: $p \ll n$ olduğu için gürültü dilemması yoktur ve PC1, doğrudan en güçlü tekil yön olan "tümör büyüklüğü" eksenidir — bu da neredeyse mükemmel M-B ayrımı verir.
+
+Sonuç olarak iki veri setinde de PCA'nın görsel ayrışmayı yakalaması farklı sebeplerin manifestasyonudur: TCGA'da **şans + güçlü sinyalin BBP eşiğini aşması**, WDBC'de **veri kümesinin yapısal olarak az boyutlu olması**.
+
+=== CELL [31] markdown ===
+## Soru 3 — Covariance PCA, Her İki Veri Setinde de Correlation PCA'dan Daha İyi mi?
+
+**Hayır, durum veri setine göre değişir.** Aşağıdaki gözlemlerimize bakalım:
+
+=== CELL [32] code ===
+cov_vs_cor_df = pd.DataFrame(
+    {
+        'TCGA cov': [
+            f'{pve_tcga_cov[0] * 100:.2f}%',
+            f'{(pve_tcga_cov[0] + pve_tcga_cov[1]) * 100:.2f}%',
+            f'{acc_tcga_cov_k2:.4f}',
+            f'{k90_tcga_cov}',
+        ],
+        'TCGA cor': [
+            f'{pve_tcga_cor[0] * 100:.2f}%',
+            f'{(pve_tcga_cor[0] + pve_tcga_cor[1]) * 100:.2f}%',
+            f'{acc_tcga_cor_k2:.4f}',
+            f'{k90_tcga_cor}',
+        ],
+        'WDBC cov': [
+            f'{pve_wdbc_cov[0] * 100:.2f}%',
+            f'{(pve_wdbc_cov[0] + pve_wdbc_cov[1]) * 100:.2f}%',
+            f'{acc_wdbc_cov_k2:.4f}',
+            f'{k90_wdbc_cov}',
+        ],
+        'WDBC cor': [
+            f'{pve_wdbc_cor[0] * 100:.2f}%',
+            f'{(pve_wdbc_cor[0] + pve_wdbc_cor[1]) * 100:.2f}%',
+            f'{acc_wdbc_cor_k2:.4f}',
+            f'{k90_wdbc_cor}',
+        ],
+    },
+    index=['PC1 PVE', 'PC1+PC2 PVE', 'PCA(k=2) KNN acc', 'k for >=90% PVE'],
+)
+cov_vs_cor_df
+
+=== CELL [33] markdown ===
+### Yorum
+
+1. **TCGA için covariance kazanır.** Gen ekspresyon değerleri zaten aynı birimde (log-RNA-seq) ölçülmüştür ve gen-spesifik varyans **biyolojik bilgi taşır**: yüksek varyanslı genler doğrudan kanser tipini ayıran marker'lardır. Standardize edersek bu marker'ları silikleştiririz; sonuç olarak PC1 daha az bilgi yakalar ve aynı PVE seviyesine ulaşmak için daha fazla bileşen gerekir.
+2. **WDBC için correlation kazanır.** 30 özellik tamamen farklı birimlerdedir: `area_mean` $\in [143, 2501]$ mm², `smoothness_mean` $\in [0.05, 0.16]$ adımsızdır. Covariance PCA'da `area_*` ailesi tek başına PC1'in **~%98**'ini domine eder — bu PCA'nın amacını boşa çıkarır çünkü 30 özellikten biri zaten yeterli olurdu. Correlation PCA bu ölçek farklılığını eşitleyip gerçek **multikolineariteyi çözer**.
+
+### Karar Kuralı (özet)
+
+- **Özellikler homojen ve birimde tutarlı** + **varyans biyolojik bilgi** → **Covariance PCA** (örn. gene expression, image pixels, sensor readings of same modality).
+- **Özellikler heterojen, farklı birimlerde** ya da **özelliklerin varyansları rastlantısal/biçimseldir** → **Correlation PCA** (örn. klinik özellikler, mali oranlar, anket skorları).
+
+Yani "Covariance daha iyidir" ya da "Correlation daha iyidir" tek başına yanlış bir genellemedir; doğru karar veri setinin **semantik yapısına** bağlıdır.
+
+=== CELL [34] markdown ===
+# Bölüm 6 — Sonuçlar ve Tartışma
+
+## 6.1 — Temel Bulgular Özeti
+
+Bu proje boyunca aynı algoritmayı (**PCA**) iki **yapısal olarak zıt** kanser veri seti üzerinde uyguladık ve şu sonuçlara vardık:
+
+1. **PCA'nın geometrik yorumu evrenseldir.** Her iki veri setinde de PCA, verinin kovaryans elipsoidinin ana eksenlerini bulur. Boyut sayısı (30 vs 20.000+) bu geometriyi değiştirmez, sadece **eigenvalue spektrumunun şeklini** değiştirir.
+2. **TCGA-PANCAN ($p \gg n$):** İlk birkaç PC tek başına düşük PVE'ye sahip olsa bile 5 kanser tipini ayırmaya yeter — Marchenko–Pastur bulk'un üstüne çıkan **sinyal spike'ları** sınıf yapısıyla hizalanır. Az sayıda PC ile ham veriyle karşılaştırılabilir veya daha iyi KNN performansı elde edilir.
+3. **WDBC ($p \ll n$):** PCA, yüksek korelasyonlu 30 özelliği **2-3 yorumlanabilir morfolojik eksene** sıkıştırır: "tümör büyüklüğü/şiddeti" (PC1) ve "dokusal düzensizlik" (PC2). Correlation PCA, ölçek farklılıklarını eşitleyerek covariance PCA'nın `area`-baskınlık sorununu çözer.
+4. **Önişleme tercihi şablonik değildir.** Gene expression için covariance, klinik morfoloji için correlation — bu kural veri setlerinin semantik yapısından doğar, evrensel bir reçete değildir.
+5. **PCA + KNN, ham veri + KNN'den her iki rejimde de geri kalmaz**, üstelik onlarca-binlerce kat daha az özellikle çalışır. Bu, PCA'nın yalnız görselleştirme aracı değil, **gerçek bir dimensionality reduction** tekniği olduğunun kanıtıdır.
+
+## 6.2 — PCA'nın Güçlü ve Zayıf Yönleri
+
+**Güçlü yönler:**
+
+- **Deterministik** — random initialization yok; aynı veri her zaman aynı sonucu verir (işarete kadar).
+- **Hızlı ve ölçeklenebilir** — SVD ile $\mathcal{O}(\min(n,p)^2 \cdot \max(n,p))$; randomized SVD ile daha hızlı.
+- **Yorumlanabilir** — her PC, orijinal özelliklerin lineer kombinasyonudur; loadings biyolojik/klinik yorumlanabilir.
+- **Ortogonal eksenler** — multikolineariteyi otomatik kaldırır, sonraki regresyon/sınıflandırma modellerini istikrara kavuşturur.
+- **Optimal lineer reconstruction** — Eckart–Young garantisi.
+
+**Zayıf yönler:**
+
+- **Yalnız lineer.** Eğri manifoldları yakalayamaz (sarmal sarılmış veri için başarısız). t-SNE, UMAP gibi non-lineer alternatifler bu boşluğu doldurur.
+- **Outlier'lara duyarlı.** Varyans karesel olarak girer, tek bir aykırı örnek PC eksenlerini bozabilir. Robust PCA (RPCA) bu sorunu adresler.
+- **Unsupervised.** Sınıf etiketinden habersizdir; sınıfı en iyi ayıran yön ille de en yüksek varyanslı yön olmayabilir. **Linear Discriminant Analysis (LDA)** bu boşluğu doldurur.
+- **Ölçek-duyarlı önişleme kararı.** Covariance vs correlation seçimi keyfi değildir ve sonuçları kökten değiştirir.
+
+## 6.3 — Bu Projede Öğrenilen Lineer Cebir Kavramları
+
+PCA, soyut lineer cebir kavramlarının uygulamada nasıl somutlaştığını gösteren **paradigma bir örnektir**. Şu kavramlar projenin merkezindedir:
+
+1. **Eigendecomposition** ($S = V \Lambda V^\top$). Simetrik PSD matrisin spektral teorem ile gerçek eigenvalue'lar ve ortogonal eigenvektörlere ayrıştırılması.
+2. **Singular Value Decomposition** ($\tilde{X} = U \Sigma V^\top$). Eigendecomposition'a göre daha numerik kararlı, $p \gg n$ rejiminde tek pratik seçenek.
+3. **Ortogonal projeksiyon.** PC skorları, verinin $\mathrm{span}(v_1, \ldots, v_k)$ alt uzayına olan dik izdüşümüdür. Bu "yakın olma"nın $\ell_2$ anlamında optimal olduğu Eckart–Young teoremi ile garantilenmiştir.
+4. **Basis change.** PCA, standart koordinatlardan eigenvektör tabanına lineer dönüşümdür. Bu yeni tabanda kovaryans matrisi köşegenleşir.
+5. **Rank-$k$ approximation.** $\hat{X}^{(k)} = \bar{x} + U_k \Sigma_k V_k^\top$, Frobenius normu altında orijinal $\tilde{X}$'in mümkün olan en iyi rank-$k$ yaklaşımıdır.
+6. **Quadratic form maximization.** $v^\top S v$'nin $\lVert v \rVert = 1$ küre üzerinde maksimize edilmesi → Rayleigh quotient → eigenvalue problemi.
+7. **Lagrange multipliers.** Kısıtlı optimizasyonun stasyoner noktalarının eigenvektörler olduğunun türetilmesi.
+8. **Trace ve determinant özdeşlikleri.** $\mathrm{tr}(S) = \sum \lambda_k$ — toplam varyans iz'e eşit, eigendecomposition koruyuculuğunun pratik sonucu.
+
+## 6.4 — Gelecek Çalışma
+
+Bu projenin doğal devamları:
+
+- **t-SNE / UMAP karşılaştırması.** TCGA üzerinde non-lineer manifold öğrenme tekniklerinin PCA'ya göre nasıl performans gösterdiği — özellikle alt sınıflar (BRCA-luminal A vs B gibi) içinde daha ince yapıları yakalayıp yakalayamadığı.
+- **Linear Discriminant Analysis (LDA).** PCA unsupervised; LDA ise sınıf etiketini kullanarak **sınıflar-arası varyans / sınıf-içi varyans** oranını maksimize eder. WDBC'de M-B ayrımı için doğal kıyas; TCGA'da 5 sınıf arası ayrım için $\min(n - 1, p, c - 1)$ boyutlu projeksiyon verir.
+- **Sparse PCA.** Yüklemeleri seyrekleştirip her PC'yi az sayıda gene bağlayan varyantı. Biyolojik yorumlanabilirliği artırır — bir PC'nin "binlerce genden gelen küçük katkılar" yerine "40 genin doğrudan kombinasyonu" olduğunu söyleyebilmek değerlidir.
+- **Kernel PCA.** Doğrusal olmayan eksen aramak için kernel trick. Gauss kernel ile RBF-PCA, TCGA'daki alt-sınıfları daha iyi çözebilir.
+- **Supervised PCA.** Targeted PCA varyantı: sadece $y$ ile korele olan PC bileşenlerini seçer; downstream sınıflandırma için en optimal lineer reduction.
+- **Robust PCA.** $\tilde{X} = L + S$ ayrışımı (düşük-rank + seyrek bozulma) — outlier-dayanıklı PCA. Klinik verideki ölçüm hataları ve dosyalama hatalarına karşı koruma sağlar.
+
+---
+
+### Kapanış
+
+PCA, lineer cebrin saf bir uygulaması olmasının ötesinde, **veriyi sadeleştirip onun gizli yapısını ortaya çıkaran** bir mercektir. Ders boyunca öğrendiğimiz eigendecomposition, SVD, ortogonal projeksiyon ve rank-$k$ approximation kavramları bu projede teori değil, **gerçek kanser veri seti üzerinde işleyen somut araçlar** olarak buluştu. Aynı algoritmanın $p = 30$ ve $p = 20{,}531$ gibi iki uçta nasıl farklı davrandığını görmek, **boyutun matematiğinin biyolojiyle nasıl iç içe geçtiğini** gösterdi — bu, projenin lineer cebir dersine kazandırdığı en değerli derstir.
+

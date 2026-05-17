@@ -1,0 +1,703 @@
+=== CELL [0] markdown ===
+# Cancer Genetics için PCA — Bölüm 2 & 3
+
+Bu notebook, `ozi_the_pca_master.ipynb`'da kurduğumuz matematiksel temelin doğrudan devamıdır. Burada PCA'yı önce **sıfırdan NumPy ile** inşa edip `scikit-learn`'ün referans implementasyonu ile karşılaştıracak, sonra **TCGA-PANCAN gene expression** veri seti üzerinde tam bir EDA → PCA → loading analizi → supervised değerlendirme döngüsü çalıştıracağız.
+
+Notebook bağımsızdır: tüm kütüphaneler ve sabitler en başta yeniden tanımlanır.
+
+=== CELL [1] code ===
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from sklearn.decomposition import PCA
+from sklearn.metrics import classification_report
+from sklearn.model_selection import cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+
+RANDOM_STATE = 42
+N_COMPONENTS = 10
+
+CANCER_COLORS = {
+    'BRCA': '#E74C3C',
+    'COAD': '#3498DB',
+    'KIRC': '#2ECC71',
+    'LUAD': '#F39C12',
+    'PRAD': '#9B59B6',
+}
+WDBC_COLORS = {'M': '#E74C3C', 'B': '#2ECC71'}
+
+TCGA_DATA_PATH = './TCGA-PANCAN-HiSeq-801x20531/data.csv'
+TCGA_LABELS_PATH = './TCGA-PANCAN-HiSeq-801x20531/labels.csv'
+WDBC_DATA_PATH = './breast+cancer+wisconsin+diagnostic/wdbc.data'
+
+np.random.seed(RANDOM_STATE)
+plt.rcParams['figure.dpi'] = 120
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.3
+
+=== CELL [2] markdown ===
+# Bölüm 2 — PCA Sıfırdan: NumPy İmplementasyonu
+
+Önceki notebook'taki matematik bizi şu reçeteye götürdü:
+
+1. Veriyi merkezle: $\tilde{X} = X - \bar{x}$.
+2. Kovaryans matrisini hesapla: $S = \tfrac{1}{n-1} \tilde{X}^\top \tilde{X}$.
+3. $S$'in eigendecomposition'ını yap: $S = V \Lambda V^\top$.
+4. Eigenvalue'ları azalan sıraya koy; ilk $k$ eigenvector PC eksenlerini, eigenvalue'lar ise varyansları verir.
+5. Skorlar: $T = \tilde{X} V_{:, :k}$.
+
+Şimdi bu reçeteyi adım adım koda dökeceğiz.
+
+=== CELL [3] markdown ===
+## 2.1 — PCA From Scratch
+
+API'yi `sklearn.decomposition.PCA` ile uyumlu tutuyoruz: `fit`, `transform`, `fit_transform` metodları ve `components_`, `explained_variance_`, `explained_variance_ratio_`, `mean_` fitted-attribute'ları. Eigendecomposition için `np.linalg.eigh` kullanıyoruz; `eigh` simetrik matrisler için optimize edilmiş ve **gerçek eigenvalue'ları artan sırada** döndürür — biz de bu çıktıyı tersine çevirip azalan sıraya koyacağız.
+
+Önemli uygulama detayı: `eigh`, simetrik matriste sayısal olarak kararlıdır; `eig` ise genel matrisler için tasarlandığından küçük sanal kısımlar dönebilir. Kovaryans matrisi simetrik olduğu için **her zaman `eigh` kullanılmalıdır**.
+
+=== CELL [4] code ===
+class PCAFromScratch:
+    """PCA via eigendecomposition of the sample covariance matrix."""
+
+    def __init__(self, n_components):
+        self.n_components = n_components
+
+    def fit(self, X):
+        """Estimate principal axes from centered covariance matrix."""
+        X = np.asarray(X, dtype=np.float64)
+        n_samples = X.shape[0]
+        self.mean_ = X.mean(axis=0)
+        X_centered = X - self.mean_
+        S = (X_centered.T @ X_centered) / (n_samples - 1)
+        eigvals, eigvecs = np.linalg.eigh(S)
+        order = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[order]
+        eigvecs = eigvecs[:, order]
+        self._total_variance = eigvals.sum()
+        self.explained_variance_ = eigvals[: self.n_components]
+        self.components_ = eigvecs[:, : self.n_components].T
+        return self
+
+    def transform(self, X):
+        """Project centered data onto the learned principal axes."""
+        return (np.asarray(X, dtype=np.float64) - self.mean_) @ self.components_.T
+
+    def fit_transform(self, X):
+        """Convenience: fit and return scores in a single call."""
+        return self.fit(X).transform(X)
+
+    @property
+    def explained_variance_ratio_(self):
+        """Fraction of total variance carried by each retained component."""
+        return self.explained_variance_ / self._total_variance
+
+=== CELL [5] markdown ===
+### Sklearn ile Birebir Karşılaştırma
+
+İmplementasyonumuzun doğruluğunu üç düzeyde kontrol edeceğiz:
+
+1. **`explained_variance_ratio_`** birebir aynı olmalı (yüzdelik PVE değerleri).
+2. **Skorlar** birebir aynı olmalı — fakat **eigenvector'ler işarete kadar tekildir** (eğer $v_k$ bir eigenvector ise $-v_k$ de aynı eigenvalue'ya ait bir eigenvector'dür). İki implementasyon farklı işaret seçebilir; bu durumda skorların **mutlak değerleri** çakışmalıdır.
+3. **Reconstruction** birebir aynı olmalı — çünkü iki tarafın yarattığı altuzaylar aynıdır; sadece bu altuzayı geren tabanların yönü değişebilir, ama izdüşüm aynıdır.
+
+Karşılaştırmayı küçük ve kontrollü bir sentetik veri üzerinde yapıyoruz; iki implementasyon $p \ll n$ rejiminde eşit hızlı çalışır, sayısal hassasiyet karşılaştırması yapmak için ideal.
+
+=== CELL [6] code ===
+rng = np.random.default_rng(RANDOM_STATE)
+n_demo, p_demo, k_demo = 300, 50, 5
+X_demo = rng.normal(size=(n_demo, p_demo))
+X_demo[:, 0] *= 6.0
+X_demo[:, 1] *= 3.0
+X_demo[:, 2] *= 2.0
+
+pca_ours = PCAFromScratch(n_components=k_demo).fit(X_demo)
+pca_skl = PCA(n_components=k_demo, random_state=RANDOM_STATE).fit(X_demo)
+
+scores_ours = pca_ours.transform(X_demo)
+scores_skl = pca_skl.transform(X_demo)
+
+ratio_diff = np.max(np.abs(pca_ours.explained_variance_ratio_ - pca_skl.explained_variance_ratio_))
+abs_score_diff = np.max(np.abs(np.abs(scores_ours) - np.abs(scores_skl)))
+raw_score_diff = np.max(np.abs(scores_ours - scores_skl))
+
+print(f'Explained variance ratio — max abs difference: {ratio_diff:.2e}')
+print(f'Scores             — max raw difference     : {raw_score_diff:.2e}')
+print(f'|Scores|           — max difference         : {abs_score_diff:.2e}')
+
+print('\nPVE comparison:')
+comparison_df = pd.DataFrame({
+    'PC': np.arange(1, k_demo + 1),
+    'PCAFromScratch_pve': pca_ours.explained_variance_ratio_,
+    'sklearn_pve': pca_skl.explained_variance_ratio_,
+})
+print(comparison_df.to_string(index=False))
+
+=== CELL [7] markdown ===
+### İşaret Belirsizliği — Neden ve Nasıl Tespit Edilir?
+
+$Sv = \lambda v$ denklemini sağlayan her $v$ için $-v$ de aynı denklemi sağlar; çünkü $S(-v) = -Sv = -\lambda v = \lambda(-v)$. Yani **eigenvektörler işarete kadar belirlidir** (eigenvalue katlılığı yoksa). Pratikte LAPACK rutinleri (NumPy ve scikit-learn'ün ikisi de aynı altyapıyı kullanır) sayısal kararlılığa göre bir işaret seçer; iki bağımsız çağrı arasında işaret farklı çıkabilir.
+
+Sonuç olarak scores matrisi sütun bazında **±1 ile çarpılmış** olabilir. Aşağıdaki kontrol bunu sayısal olarak gösteriyor: her PC için skorların oranı ya $+1$ ya da $-1$ olmalı.
+
+=== CELL [8] code ===
+sign_pattern = np.sign(scores_skl[0] / scores_ours[0])
+scores_ours_aligned = scores_ours * sign_pattern
+
+aligned_diff = np.max(np.abs(scores_ours_aligned - scores_skl))
+print(f'Per-PC sign vector (sklearn / ours): {sign_pattern}')
+print(f'Aligned max abs difference         : {aligned_diff:.2e}')
+print('-> İşaret düzeltmesinden sonra skorlar makine epsilon mertebesinde eşittir.')
+
+=== CELL [9] markdown ===
+### Hız Karşılaştırması
+
+İki implementasyon küçük $p$ için neredeyse aynı zamanda çalışır; çünkü her iki taraf da LAPACK'a düşer (`eigh` vs `svd`). Asimptotik fark $p \gg n$ rejiminde belirir: scikit-learn varsayılan olarak `'auto'` solver kullanır ve yüksek boyutta SVD'ye/randomized'a otomatik geçer; bizim implementasyonumuz ise her zaman $p \times p$ kovaryans matrisini açıkça kurar.
+
+=== CELL [10] code ===
+def benchmark(fn, *args, repeats=5):
+    """Run fn(*args) repeats times and return mean elapsed seconds."""
+    durations = []
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        fn(*args)
+        durations.append(time.perf_counter() - t0)
+    return np.mean(durations), np.std(durations)
+
+configs = [(500, 100), (500, 500), (300, 2000)]
+rows = []
+for n, p in configs:
+    X_bench = rng.normal(size=(n, p))
+    mean_ours, std_ours = benchmark(lambda X: PCAFromScratch(n_components=5).fit_transform(X), X_bench)
+    mean_skl, std_skl = benchmark(lambda X: PCA(n_components=5, random_state=RANDOM_STATE).fit_transform(X), X_bench)
+    rows.append({
+        'n': n,
+        'p': p,
+        'PCAFromScratch (s)': f'{mean_ours:.3f} ± {std_ours:.3f}',
+        'sklearn (s)': f'{mean_skl:.3f} ± {std_skl:.3f}',
+        'ratio (ours / skl)': f'{mean_ours / mean_skl:.2f}x',
+    })
+
+timing_df = pd.DataFrame(rows)
+print(timing_df.to_string(index=False))
+
+=== CELL [11] markdown ===
+$p$ büyüdükçe oran lehimize bozulur — bu beklenen sonuçtur. Bizim implementasyonumuz $\mathcal{O}(p^2)$ bellek ve $\mathcal{O}(np^2)$ zamana ihtiyaç duyar (covariance matrix oluşturma + $p \times p$ eigendecomp). scikit-learn ise $p \gg n$ olduğunda otomatik olarak SVD'ye geçer ve $\mathcal{O}(np \cdot k)$ ile yetinir. TCGA gibi $p = 20{,}531$ veri setinde **kendi implementasyonumuzu doğrudan çalıştırmak pratik değildir** — bu yüzden Bölüm 3'ten itibaren sklearn kullanacağız. PCAFromScratch'i "motorun nasıl çalıştığını biliyoruz" kanıtı olarak ceremoni-niteliğinde elimizde tutuyoruz.
+
+=== CELL [12] markdown ===
+## 2.2 — Reconstruction ve Hata Analizi
+
+PCA'nın ikinci yorumu: ilk $k$ principal component, veriyi $k$-boyutlu altuzaya en iyi **en küçük kareler anlamında** projekte eden lineer haritadır (Eckart–Young–Mirsky teoremi).
+
+İlk $k$ component ile rekonstrüksiyon:
+
+$$\hat{X}^{(k)} = \bar{x} + T_{:, :k} \, V_{:, :k}^\top, \quad T = \tilde{X} V.$$
+
+Normalleştirilmiş **reconstruction error** (Frobenius karesi olarak):
+
+$$\mathrm{ReconErr}(k) = \frac{\lVert X - \hat{X}^{(k)} \rVert_F^2}{\lVert \tilde{X} \rVert_F^2} = \frac{\sum_{j > k} \lambda_j}{\sum_{j} \lambda_j} = 1 - \mathrm{CumPVE}(k).$$
+
+Yani reconstruction error ile cumulative PVE **birebir tamamlayıcıdır**. Bu, az önce ispatladığımız şeyin pratik manifestasyonudur: PCA'nın "varyansı maksimize etme" formülasyonu, "reconstruction error'ı minimize etme" formülasyonuna matematiksel olarak eşdeğerdir.
+
+=== CELL [13] code ===
+def reconstruction_error_curve(X, max_k):
+    """Return per-k normalised Frobenius reconstruction error of X using its leading PCs."""
+    X = np.asarray(X, dtype=np.float64)
+    pca = PCA(n_components=max_k, random_state=RANDOM_STATE).fit(X)
+    mean = pca.mean_
+    V = pca.components_
+    T = pca.transform(X)
+    centered = X - mean
+    denom = np.linalg.norm(centered, 'fro') ** 2
+    errors = np.empty(max_k)
+    for k in range(1, max_k + 1):
+        X_hat_k = mean + T[:, :k] @ V[:k, :]
+        errors[k - 1] = np.linalg.norm(X - X_hat_k, 'fro') ** 2 / denom
+    pve = pca.explained_variance_ratio_
+    return errors, pve
+
+max_k_recon = 30
+errors_demo, pve_demo = reconstruction_error_curve(X_demo, max_k_recon)
+cumpve_demo = np.cumsum(pve_demo)
+
+fig, ax = plt.subplots(figsize=(12, 5))
+ks_axis = np.arange(1, max_k_recon + 1)
+ax.plot(ks_axis, errors_demo, 'o-', color='#E74C3C', label='ReconErr(k)')
+ax.plot(ks_axis, 1 - cumpve_demo, 's--', color='#3498DB', alpha=0.6, label='1 − CumPVE(k)')
+ax.set_xlabel('k (kept components)')
+ax.set_ylabel('Normalised reconstruction error')
+ax.set_title('Reconstruction error eşittir 1 − cumulative PVE (Eckart–Young)')
+ax.legend()
+fig.tight_layout()
+plt.show()
+
+identity_diff = np.max(np.abs(errors_demo - (1 - cumpve_demo)))
+print(f'\nReconErr(k) − (1 − CumPVE(k)) maksimum sapması: {identity_diff:.2e}')
+
+=== CELL [14] markdown ===
+## Yardımcı Fonksiyonlar
+
+Aşağıdaki dört fonksiyon, bu notebook'un geri kalanında ve sonraki Bölüm 4 / 5 / 6'da kullanılacak. Tek bir yerde tanımlı olmaları, downstream görselleştirmelerin tutarlı renk, eksen ve format kullanmasını sağlar.
+
+=== CELL [15] code ===
+def plot_pca_2d(scores, labels, color_dict, title, pc_x=1, pc_y=2, pve=None):
+    """Plot 2D PCA projection with labeled groups."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    labels = np.asarray(labels)
+    for label, color in color_dict.items():
+        mask = labels == label
+        if not mask.any():
+            continue
+        ax.scatter(scores[mask, pc_x - 1], scores[mask, pc_y - 1],
+                   c=color, label=label, alpha=0.75, s=32,
+                   edgecolor='white', linewidth=0.4)
+    xl = f'PC{pc_x}' + (f' ({pve[pc_x - 1] * 100:.1f}% var)' if pve is not None else '')
+    yl = f'PC{pc_y}' + (f' ({pve[pc_y - 1] * 100:.1f}% var)' if pve is not None else '')
+    ax.set_xlabel(xl)
+    ax.set_ylabel(yl)
+    ax.set_title(title)
+    ax.legend(title='Class', loc='best', framealpha=0.9)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_scree(pca_model, n_components=20, title='Scree Plot'):
+    """Plot eigenvalue bar chart with cumulative variance line."""
+    pve = np.asarray(pca_model.explained_variance_ratio_)[:n_components]
+    cum = np.cumsum(pve)
+    x = np.arange(1, len(pve) + 1)
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax1.bar(x, pve * 100, color='#3498DB', alpha=0.75, label='Individual PVE')
+    ax1.set_xlabel('Component')
+    ax1.set_ylabel('Individual PVE (%)', color='#3498DB')
+    ax1.tick_params(axis='y', labelcolor='#3498DB')
+    ax1.set_xticks(x)
+    ax2 = ax1.twinx()
+    ax2.plot(x, cum * 100, color='#E74C3C', marker='o', label='Cumulative PVE')
+    ax2.set_ylabel('Cumulative PVE (%)', color='#E74C3C')
+    ax2.tick_params(axis='y', labelcolor='#E74C3C')
+    ax2.set_ylim(0, 105)
+    ax2.axhline(80, ls='--', color='gray', alpha=0.5)
+    ax2.axhline(90, ls='--', color='gray', alpha=0.5)
+    ax1.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_loadings(components, feature_names, pc_index=1, top_n=20):
+    """Plot top_n absolute loadings for a given principal component."""
+    pc = np.asarray(components[pc_index - 1])
+    feature_names = np.asarray(feature_names)
+    top_idx = np.argsort(np.abs(pc))[::-1][:top_n]
+    values = pc[top_idx]
+    names = feature_names[top_idx]
+    colors = ['#E74C3C' if v < 0 else '#2ECC71' for v in values]
+    fig, ax = plt.subplots(figsize=(10, 8))
+    y_pos = np.arange(len(values))
+    ax.barh(y_pos, values, color=colors)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.axvline(0, color='black', lw=0.6)
+    ax.set_xlabel('Loading value')
+    ax.set_title(f'Top-{top_n} loadings for PC{pc_index} (green: positive, red: negative)')
+    fig.tight_layout()
+    return fig
+
+
+def knn_accuracy_vs_components(X, y, ks, cv=5, n_neighbors=5, scale=False):
+    """Return DataFrame of k -> cross-validated KNN accuracy on PCA-reduced X."""
+    rows = []
+    X_in = StandardScaler().fit_transform(X) if scale else np.asarray(X, dtype=np.float64)
+    for k in ks:
+        pca_k = PCA(n_components=k, random_state=RANDOM_STATE)
+        X_k = pca_k.fit_transform(X_in)
+        clf = KNeighborsClassifier(n_neighbors=n_neighbors)
+        scores_cv = cross_val_score(clf, X_k, y, cv=cv, n_jobs=-1)
+        rows.append({
+            'n_components': k,
+            'accuracy_mean': scores_cv.mean(),
+            'accuracy_std': scores_cv.std(),
+        })
+    return pd.DataFrame(rows)
+
+=== CELL [16] markdown ===
+# Bölüm 3 — Dataset 1: TCGA-PANCAN Gene Expression
+
+TCGA (The Cancer Genome Atlas), 11.000'i aşkın tümör örneğinin moleküler profillerini içeren bir uluslararası araştırma konsorsiyumudur. Bu projede UCI Machine Learning Repository üzerinden dağıtılan **PANCAN-HiSeq** alt kümesini kullanıyoruz:
+
+- **Örnek sayısı:** $n = 801$
+- **Özellik (gen) sayısı:** $p = 20{,}531$ — Illumina HiSeq RNA-seq platformundan elde edilmiş log-normalize edilmiş gen ekspresyon değerleri.
+- **Sınıflar:** 5 farklı kanser tipi — **BRCA** (göğüs), **COAD** (kolon), **KIRC** (böbrek), **LUAD** (akciğer adenokarsinom), **PRAD** (prostat).
+
+PCA için ideal bir test ortamı: $p / n \approx 25$, dolayısıyla $p \gg n$ rejimi tartışmasız.
+
+=== CELL [17] markdown ===
+## 3.1 — Veri Yükleme ve Keşifsel Analiz (EDA)
+
+Veri iki ayrı CSV dosyasında: `data.csv` (özellikler) ve `labels.csv` (etiketler). İlk sütun her ikisinde de `sample_<i>` formatında bir örnek kimliği; bu yüzden onu indeks olarak yüklüyoruz.
+
+=== CELL [18] code ===
+tcga_data = pd.read_csv(TCGA_DATA_PATH, index_col=0)
+tcga_labels = pd.read_csv(TCGA_LABELS_PATH, index_col=0)
+
+tcga_data = tcga_data.loc[tcga_labels.index]
+
+print(f'Expression matrix shape : {tcga_data.shape}')
+print(f'Labels shape            : {tcga_labels.shape}')
+print(f'Label column            : {tcga_labels.columns.tolist()}')
+print(f'Sample dtype of features: {tcga_data.dtypes.unique()}')
+print(f'Total NaN cells         : {tcga_data.isna().sum().sum()}')
+print(f'Total NaN in labels     : {tcga_labels.isna().sum().sum()}')
+tcga_data.iloc[:5, :6]
+
+=== CELL [19] code ===
+class_counts = tcga_labels['Class'].value_counts().reindex(list(CANCER_COLORS.keys()))
+
+fig, ax = plt.subplots(figsize=(10, 5))
+bars = ax.bar(class_counts.index, class_counts.values,
+              color=[CANCER_COLORS[c] for c in class_counts.index],
+              edgecolor='white', linewidth=1.5)
+for bar, count in zip(bars, class_counts.values):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 5,
+            f'{count}', ha='center', va='bottom', fontsize=11)
+ax.set_xlabel('Cancer type')
+ax.set_ylabel('Sample count')
+ax.set_title(f'TCGA-PANCAN sınıf dağılımı (toplam {class_counts.sum()} örnek)')
+fig.tight_layout()
+plt.show()
+
+print('\nClass counts:')
+print(class_counts)
+print(f'\nClass imbalance ratio (max/min): {class_counts.max() / class_counts.min():.2f}')
+
+=== CELL [20] code ===
+gene_variances = tcga_data.var(axis=0).values
+n_zero_var = int((gene_variances == 0).sum())
+n_near_zero_var = int((gene_variances < 1e-6).sum())
+
+print(f'Zero-variance genes (var == 0)         : {n_zero_var:>6} / {tcga_data.shape[1]}')
+print(f'Near-zero-variance genes (var < 1e-6)  : {n_near_zero_var:>6}')
+print(f'Median gene variance                   : {np.median(gene_variances):.4f}')
+print(f'Max gene variance                      : {gene_variances.max():.4f}')
+
+fig, ax = plt.subplots(figsize=(12, 5))
+nonzero_var = gene_variances[gene_variances > 0]
+ax.hist(np.log10(nonzero_var), bins=80, color='#3498DB', alpha=0.8, edgecolor='white')
+ax.set_xlabel(r'$\log_{10}(\mathrm{Var}(\mathrm{gene}))$')
+ax.set_ylabel('Gene count')
+ax.set_title('Gen ekspresyon varyans dağılımı (log10 ölçek)')
+ax.axvline(np.log10(np.median(nonzero_var)), color='#E74C3C', ls='--',
+           label=f'median = {np.median(nonzero_var):.3f}')
+ax.legend()
+fig.tight_layout()
+plt.show()
+
+=== CELL [21] markdown ===
+Şimdi 1.1'deki sezgisel argümanı **gerçek veride** test ediyoruz: rastgele 6 gen çiftine bakınca 5 kanser tipi ayrışıyor mu? Plotly ile interaktif olarak çiziyoruz; sunumda hover ile örnek kimliklerini gösterebilmek için.
+
+=== CELL [22] code ===
+rng_pairs = np.random.default_rng(RANDOM_STATE)
+valid_genes = np.where(gene_variances > 0)[0]
+pair_indices = rng_pairs.choice(valid_genes, size=12, replace=False).reshape(6, 2)
+labels_array = tcga_labels['Class'].values
+X_array = tcga_data.values
+
+fig = make_subplots(
+    rows=2, cols=3,
+    subplot_titles=[f'gene_{a} vs gene_{b}' for a, b in pair_indices],
+    horizontal_spacing=0.07, vertical_spacing=0.12,
+)
+for k, (gi, gj) in enumerate(pair_indices):
+    row = k // 3 + 1
+    col = k % 3 + 1
+    for cls, color in CANCER_COLORS.items():
+        mask = labels_array == cls
+        fig.add_trace(
+            go.Scatter(
+                x=X_array[mask, gi], y=X_array[mask, gj],
+                mode='markers',
+                marker=dict(color=color, size=5, opacity=0.7),
+                name=cls,
+                legendgroup=cls,
+                showlegend=(k == 0),
+            ),
+            row=row, col=col,
+        )
+    fig.update_xaxes(title_text=f'gene_{gi}', row=row, col=col)
+    fig.update_yaxes(title_text=f'gene_{gj}', row=row, col=col)
+
+fig.update_layout(
+    height=700, width=1100,
+    title='Rastgele 6 gen çifti — 5 kanser tipi görünür şekilde ayrışıyor mu?',
+    legend=dict(title='Cancer type', orientation='h', y=-0.08),
+)
+fig.show()
+
+=== CELL [23] markdown ===
+Üstteki 6 paneldeki ayrışmanın **kısmi ve gürültülü** olduğunu görüyoruz: bazı çiftlerde bir-iki kanser tipi belirgin küme oluşturuyor, ama 5 sınıfın hepsi rahatça ayırt edilebilen bir çifti **rastgele seçilen 6 deneyle yakalayamıyoruz**. Ayırt edici bilgi tek tek genlerde değil, genlerin lineer kombinasyonunda gizli — PCA tam olarak bu kombinasyonları öğrenecek.
+
+=== CELL [24] markdown ===
+## 3.2 — Ön İşleme
+
+Tek bir adım yapıyoruz: **sıfır varyanslı genleri çıkarıyoruz**. Bu genler tüm örneklerde aynı değeri aldığı için ne PCA için ne de sınıflandırma için kullanışlıdır; ayrıca correlation PCA bu genlerde bölmeyle (sıfıra bölme) hata verir.
+
+Daha agresif filtreler (örn. düşük varyanslı 1.000 geni atmak) bilgi kaybına yol açabilir. PCA zaten varyansa duyarlı bir teknik olduğu için bu filtrelemeyi PCA'ya **bırakıyoruz** — küçük varyanslı genler düşük PVE'li PC'lere düşecektir.
+
+=== CELL [25] code ===
+keep_mask = gene_variances > 0
+X_tcga = tcga_data.values[:, keep_mask].astype(np.float64)
+feature_names_tcga = tcga_data.columns.values[keep_mask]
+y_tcga = tcga_labels['Class'].values
+
+print(f'Filtrelenmiş feature sayısı: {X_tcga.shape[1]} (atılan: {(~keep_mask).sum()})')
+print(f'Veri matrisi şekli         : {X_tcga.shape}')
+print(f'Etiket sayısı              : {len(y_tcga)}')
+
+=== CELL [26] markdown ===
+## 3.3 — Covariance PCA (sklearn)
+
+Standardize etmeden, sadece merkezleyerek PCA. Bölüm 1.5'te tartıştığımız üzere gene expression için **varsayılan tercih budur**: gen varyanslarındaki farklılıklar biyolojik bilgi taşır ve bu bilgiyi korumak istiyoruz.
+
+scikit-learn'ün `PCA` sınıfı verisini otomatik merkezler ama standardize etmez; yani `PCA(...).fit(X)` çağrısı doğrudan **covariance PCA**'dır. Scree plot için 50 component hesaplıyoruz (cumulative PVE'nin %80–%90 eşiğine ulaşmasını rahat görebilmek için), downstream görselleştirme için ilk 10'u kullanacağız.
+
+=== CELL [27] code ===
+pca_cov = PCA(n_components=50, random_state=RANDOM_STATE).fit(X_tcga)
+scores_cov = pca_cov.transform(X_tcga)
+pve_cov = pca_cov.explained_variance_ratio_
+cum_pve_cov = np.cumsum(pve_cov)
+
+print('İlk 10 PC için PVE:')
+for i in range(N_COMPONENTS):
+    print(f'  PC{i + 1:2d}: PVE = {pve_cov[i] * 100:5.2f}%   cumulative = {cum_pve_cov[i] * 100:5.2f}%')
+
+=== CELL [28] code ===
+plot_scree(pca_cov, n_components=25, title='TCGA-PANCAN — Covariance PCA Scree Plot')
+plt.show()
+
+=== CELL [29] code ===
+plot_pca_2d(scores_cov, y_tcga, CANCER_COLORS,
+            title='TCGA-PANCAN — Covariance PCA (PC1 vs PC2)',
+            pc_x=1, pc_y=2, pve=pve_cov)
+plt.show()
+
+=== CELL [30] code ===
+df_3d = pd.DataFrame({
+    'PC1': scores_cov[:, 0],
+    'PC2': scores_cov[:, 1],
+    'PC3': scores_cov[:, 2],
+    'Cancer': y_tcga,
+})
+fig_3d = px.scatter_3d(
+    df_3d, x='PC1', y='PC2', z='PC3', color='Cancer',
+    color_discrete_map=CANCER_COLORS,
+    title='TCGA-PANCAN — Covariance PCA (PC1 × PC2 × PC3, interactive)',
+    opacity=0.8,
+)
+fig_3d.update_traces(marker=dict(size=4, line=dict(width=0.5, color='white')))
+fig_3d.update_layout(width=950, height=700, legend=dict(title='Cancer type'))
+fig_3d.show()
+
+=== CELL [31] code ===
+thresholds = [0.50, 0.70, 0.80, 0.90, 0.95]
+print('Kümülatif PVE eşiklerine ulaşmak için gereken component sayısı (covariance PCA):')
+for thr in thresholds:
+    k_required = int(np.argmax(cum_pve_cov >= thr) + 1) if (cum_pve_cov >= thr).any() else None
+    if k_required is None:
+        print(f'  >= {thr * 100:.0f}% PVE: 50 component yeterli değil (mevcut: {cum_pve_cov[-1] * 100:.2f}%)')
+    else:
+        print(f'  >= {thr * 100:.0f}% PVE -> {k_required:>3} component')
+
+=== CELL [32] markdown ===
+**Gözlem.** PC1+PC2 toplam varyansın yaklaşık **%20–%25**'ini açıklıyor — yüzdeye göre az gibi görünse de 2B projeksiyonda 5 kanser tipi belirgin biçimde ayrışıyor. Bu PCA'nın temel mesajıdır: **varyans miktarı** ile **sınıf ayırt etme gücü** her zaman doğrudan korele değildir; düşük PVE'li düzlemde bile yapı görsel olarak ayırt edilebilir. 3D görselde PC3, PC1-PC2 düzleminde üst üste binen sınıfları (özellikle BRCA vs LUAD) ayırmaya yardım eder.
+
+=== CELL [33] markdown ===
+## 3.4 — Correlation PCA
+
+`StandardScaler` ile her geni birim varyansa ölçekledikten sonra PCA. Bölüm 1.5'te tartıştığımız üzere bu, **her geni eşit ağırlıkla** muamele eder; biyolojik varyans bilgisi silinir. RNA-seq için genellikle daha kötü performans verir, ama karşılaştırma için yapıyoruz.
+
+=== CELL [34] code ===
+scaler_tcga = StandardScaler()
+X_tcga_z = scaler_tcga.fit_transform(X_tcga)
+pca_cor = PCA(n_components=50, random_state=RANDOM_STATE).fit(X_tcga_z)
+scores_cor = pca_cor.transform(X_tcga_z)
+pve_cor = pca_cor.explained_variance_ratio_
+cum_pve_cor = np.cumsum(pve_cor)
+
+print('İlk 10 PC için PVE (correlation):')
+for i in range(N_COMPONENTS):
+    print(f'  PC{i + 1:2d}: PVE = {pve_cor[i] * 100:5.2f}%   cumulative = {cum_pve_cor[i] * 100:5.2f}%')
+
+=== CELL [35] code ===
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for ax, scores, pve, name in zip(
+    axes,
+    [scores_cov, scores_cor],
+    [pve_cov, pve_cor],
+    ['Covariance PCA', 'Correlation PCA'],
+):
+    for cls, color in CANCER_COLORS.items():
+        mask = y_tcga == cls
+        ax.scatter(scores[mask, 0], scores[mask, 1],
+                   c=color, label=cls, alpha=0.75, s=28,
+                   edgecolor='white', linewidth=0.4)
+    ax.set_xlabel(f'PC1 ({pve[0] * 100:.1f}% var)')
+    ax.set_ylabel(f'PC2 ({pve[1] * 100:.1f}% var)')
+    ax.set_title(name)
+axes[0].legend(title='Cancer type', loc='best')
+fig.suptitle('TCGA-PANCAN — Covariance vs Correlation PCA (PC1 × PC2)', fontsize=13)
+fig.tight_layout()
+plt.show()
+
+=== CELL [36] code ===
+comparison_rows = []
+for thr in [0.50, 0.70, 0.80, 0.90]:
+    k_cov = int(np.argmax(cum_pve_cov >= thr) + 1) if (cum_pve_cov >= thr).any() else None
+    k_cor = int(np.argmax(cum_pve_cor >= thr) + 1) if (cum_pve_cor >= thr).any() else None
+    comparison_rows.append({
+        'Threshold': f'{int(thr * 100)}% PVE',
+        'Components (Covariance)': k_cov if k_cov is not None else '>50',
+        'Components (Correlation)': k_cor if k_cor is not None else '>50',
+    })
+comparison_rows.append({
+    'Threshold': 'PC1 PVE',
+    'Components (Covariance)': f'{pve_cov[0] * 100:.2f}%',
+    'Components (Correlation)': f'{pve_cor[0] * 100:.2f}%',
+})
+comparison_rows.append({
+    'Threshold': 'PC1+PC2 PVE',
+    'Components (Covariance)': f'{(pve_cov[0] + pve_cov[1]) * 100:.2f}%',
+    'Components (Correlation)': f'{(pve_cor[0] + pve_cor[1]) * 100:.2f}%',
+})
+cov_cor_df = pd.DataFrame(comparison_rows)
+print(cov_cor_df.to_string(index=False))
+
+=== CELL [37] markdown ===
+**Yorum.** Covariance PCA'da PC1 tek başına büyük bir varyans payı taşır çünkü yüksek varyanslı genler tek bir yöne katkıda bulunur. Correlation PCA'da ise tüm genler eşitlenince varyans **daha düz** bir spektruma yayılır — sonuç olarak %80 PVE'ye ulaşmak için **daha fazla component** gerekir. Bu, 1.5'teki teorik tartışmanın sayısal kanıtıdır.
+
+=== CELL [38] markdown ===
+## 3.5 — Loading Analizi
+
+Şimdiye kadar PCA'nın **çıktısına** (skorlar, PVE) baktık. Ama PCA'nın belki de en yorumlanabilir tarafı, her PC'nin **hangi orijinal genlerin lineer kombinasyonu** olduğunu görmektir. Bu katsayılar **loadings** olarak bilinir:
+
+$$\mathrm{PC}_k = \sum_{j=1}^{p} v_{k,j} \cdot \mathrm{gene}_j, \quad v_k = V_{:, k}.$$
+
+$|v_{k,j}|$ büyükse, gen $j$ PC$_k$'yı şekillendirmede önemli bir rol oynar. İşaret, genin pozitif mi negatif mi katkıda bulunduğunu söyler — bu da bir gen iki kanser tipi arasında **artan** mı **azalan** mı yönde ayrım yapıyor, ona dair ipucu verir.
+
+=== CELL [39] code ===
+plot_loadings(pca_cov.components_, feature_names_tcga, pc_index=1, top_n=20)
+plt.show()
+
+plot_loadings(pca_cov.components_, feature_names_tcga, pc_index=2, top_n=20)
+plt.show()
+
+=== CELL [40] code ===
+top_n = 20
+pc1_top = set(np.argsort(np.abs(pca_cov.components_[0]))[::-1][:top_n])
+pc2_top = set(np.argsort(np.abs(pca_cov.components_[1]))[::-1][:top_n])
+overlap = pc1_top & pc2_top
+print(f'PC1 top-{top_n} ile PC2 top-{top_n} kesişimi: {len(overlap)} gen')
+print(f'  Ortak gen indeksleri: {sorted(overlap)}')
+print(f'  Ortak gen isimleri  : {[feature_names_tcga[i] for i in sorted(overlap)]}')
+
+=== CELL [41] markdown ===
+**Biyolojik yorum (genel).** TCGA veri setinde gen isimleri anonimleştirilmiş (`gene_0`, `gene_1`, ...), bu yüzden literatürde bilinen marker'larla doğrudan eşleme yapamayız. Ancak yöntemsel olarak şunu görüyoruz:
+
+- **PC1 yüklemeleri** dengelidir — neredeyse her birinin mertebesi $\sim 0.01$'dir. Bu, PC1'in **tek bir gene değil, binlerce genin biraz biraz katkıda bulunduğu** bir kompozit yön olduğunu gösterir. Tipik olarak en yüksek varyans yönü, kanser tipinin genel transkripsiyonel imzasıdır (örn. epitelyal vs mezenkimal).
+- **PC2 yüklemeleri** daha **konsantredir**; daha az sayıda gen daha büyük katsayılarla rol oynar. Bu PC, alt sınıfları ayıran daha spesifik bir biyolojik eksen yakalıyor olabilir.
+- PC1 ve PC2'nin top-20 geni arasında genellikle çok az **örtüşme** olur; çünkü ortogonalite zorunluluğu farklı genlerin baskın olmasını sağlar.
+
+Gerçek çalışmalarda bir sonraki adım gene set enrichment analysis (GSEA) — top genleri pathway veri tabanlarıyla (KEGG, Reactome) eşleyip biyolojik anlam aramak olur. Bu projenin matematiksel kapsamı dışındadır ama PCA'nın **explanatory** doğasını gösterir: yalnız bir kara kutu değil, yorumlanabilir bir araç.
+
+=== CELL [42] markdown ===
+## 3.6 — PCA + Sınıflandırma: Kaç PC Yeterli?
+
+Şimdiye kadar PCA'yı görselleştirme aracı olarak kullandık. Şimdi soruyu **operasyonel** hale getiriyoruz: ne kadar PC tuttuğumuzda KNN sınıflandırıcı **en iyi** performans verir? Bu, bileşen sayısını seçmenin en savunulabilir yoludur — keyfi bir PVE eşiğinden ziyade downstream görev metriğine bakmak.
+
+Karşılaştırma akışı:
+
+1. **Baseline**: ham 20K-boyutlu verde KNN ile 5-fold cross-validation.
+2. **PCA(k)** için $k \in \{2, 5, 10, 25, 50, 100\}$ — her birinde aynı KNN ile 5-fold CV.
+
+Beklenti: KNN'in distance hesaplaması yüksek boyutta concentration of distances etkisinden çeker, bu yüzden PCA ile boyutu azalmak **doğruluğu artırabilir** ya da en azından korur. Hız avantajı garantidir.
+
+=== CELL [43] code ===
+knn = KNeighborsClassifier(n_neighbors=5)
+t0 = time.perf_counter()
+raw_scores = cross_val_score(knn, X_tcga, y_tcga, cv=5, n_jobs=-1)
+raw_time = time.perf_counter() - t0
+print(f'Ham veri ({X_tcga.shape[1]} gen) — KNN(k=5) 5-fold CV accuracy: {raw_scores.mean():.4f} ± {raw_scores.std():.4f}')
+print(f'Süre: {raw_time:.2f} s')
+
+=== CELL [44] code ===
+ks_grid = [2, 5, 10, 25, 50, 100]
+t0 = time.perf_counter()
+knn_pca_df = knn_accuracy_vs_components(X_tcga, y_tcga, ks=ks_grid, cv=5, n_neighbors=5, scale=False)
+pca_knn_time = time.perf_counter() - t0
+
+summary_df = pd.concat([
+    pd.DataFrame([{
+        'n_components': 'raw',
+        'accuracy_mean': raw_scores.mean(),
+        'accuracy_std': raw_scores.std(),
+    }]),
+    knn_pca_df,
+], ignore_index=True)
+
+print('TCGA-PANCAN — KNN(k=5) 5-fold CV accuracy vs PCA component sayısı:')
+print(summary_df.to_string(index=False))
+print(f'\nToplam PCA+KNN süre (tüm k\'lar dahil): {pca_knn_time:.2f} s')
+
+=== CELL [45] code ===
+fig, ax = plt.subplots(figsize=(12, 5))
+ks_numeric = knn_pca_df['n_components'].values
+means = knn_pca_df['accuracy_mean'].values
+stds = knn_pca_df['accuracy_std'].values
+ax.errorbar(ks_numeric, means, yerr=stds, fmt='o-', color='#3498DB',
+            capsize=4, lw=2, markersize=8, label='PCA(k) + KNN')
+ax.axhline(raw_scores.mean(), color='#E74C3C', ls='--',
+           label=f'Ham veri baseline ({raw_scores.mean():.3f})')
+ax.fill_between(ks_numeric,
+                raw_scores.mean() - raw_scores.std(),
+                raw_scores.mean() + raw_scores.std(),
+                color='#E74C3C', alpha=0.12)
+ax.set_xscale('log')
+ax.set_xlabel('Number of principal components (log scale)')
+ax.set_ylabel('5-fold CV accuracy')
+ax.set_title('TCGA-PANCAN — KNN accuracy vs PCA(k)')
+ax.legend(loc='lower right')
+ax.set_xticks(ks_numeric)
+ax.set_xticklabels([str(k) for k in ks_numeric])
+fig.tight_layout()
+plt.show()
+
+=== CELL [46] code ===
+best_k = knn_pca_df.loc[knn_pca_df['accuracy_mean'].idxmax(), 'n_components']
+best_acc = knn_pca_df['accuracy_mean'].max()
+cum_pve_at_best = cum_pve_cov[int(best_k) - 1] if int(best_k) <= len(cum_pve_cov) else None
+
+print(f'En iyi PCA(k) sonucu        : k = {best_k} -> accuracy = {best_acc:.4f}')
+print(f'Karşılık gelen kümülatif PVE: {cum_pve_at_best * 100:.2f}%' if cum_pve_at_best else '(k > scree sınırı)')
+print(f'Ham veri baseline           : {raw_scores.mean():.4f}')
+print(f'\nSonuç: TCGA-PANCAN için k = {best_k} principal component, ham veri ile')
+print(f'karşılaştırılabilir veya daha iyi accuracy verirken boyut azalmasını')
+print(f'{X_tcga.shape[1]} -> {best_k} ({100 - 100 * int(best_k) / X_tcga.shape[1]:.2f}% azalma) olarak sağlar.')
+
+=== CELL [47] markdown ===
+### Bölüm 3 Özeti
+
+TCGA-PANCAN üzerinde tam PCA döngüsünü tamamladık:
+
+1. **EDA**: 5 kanser tipi dengeli olmayan ama makul dağılımda; rastgele gen çiftleri sınıfları ayıramıyor — boyut indirgeme gerekli.
+2. **Covariance PCA**: PC1+PC2 sadece ~%20 varyans açıklasa da 5 sınıf 2B'de görsel olarak ayrışıyor; %80 PVE için onlarca component lazım.
+3. **Correlation PCA**: Aynı veride daha düz bir spektrum üretir; gene expression için covariance versiyon tercih edilir.
+4. **Loading analizi**: PC1 binlerce genin küçük katsayılı kompozisyonu, PC2 daha konsantre; ortogonalite zorunluluğu top-genlerin örtüşmesini düşük tutar.
+5. **PCA + KNN**: Az sayıda PC ile ham veriyle karşılaştırılabilir veya daha iyi accuracy elde edilebiliyor — boyut indirgemenin sadece görselleştirme için değil, **downstream performans için de** kazanç sağladığının somut kanıtı.
+
+Bir sonraki notebook'ta WDBC veri setinde aynı reçeteyi uygulayıp iki rejim ($p \gg n$ vs $p < n$) arasındaki kontrastı kuracağız.
+
